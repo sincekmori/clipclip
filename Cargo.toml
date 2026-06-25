@@ -1,6 +1,6 @@
 [package]
 name = "clipclip"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Continuously capture audio and hand fixed-length Opus/WAV segments to your code."
 license = "MIT OR Apache-2.0"
