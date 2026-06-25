@@ -1,0 +1,43 @@
+[package]
+name = "clipclip"
+version = "0.1.0"
+edition = "2021"
+description = "Continuously capture audio and hand fixed-length Opus/WAV segments to your code."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sincekmori/clipclip"
+readme = "README.md"
+keywords = ["audio", "capture", "opus", "segment", "whisper"]
+categories = ["multimedia::audio", "multimedia::encoding"]
+
+[features]
+# Opus output is on by default (needs CMake + a C compiler to build libopus).
+default = ["opus"]
+# Ogg Opus encoding via vendored libopus/libopusenc.
+opus = ["dep:libopusenc"]
+# Silero V5 neural voice-activity detection (downloads an ONNX runtime at build
+# time, embeds the model). Without it, only the dependency-free energy gate is
+# available.
+silero = ["dep:voice_activity_detector"]
+
+[dependencies]
+cpal = "0.18"          # cross-platform capture (mic + loopback)
+rubato = "0.16"        # sample-rate conversion
+ringbuf = "0.5"        # lock-free SPSC ring buffer
+log = "0.4"
+thiserror = "2"
+
+libopusenc = { version = "0.2", optional = true }
+voice_activity_detector = { version = "0.2", optional = true }
+
+# Capture system audio (the output's monitor source) on Linux via cpal's
+# PulseAudio backend; the default ALSA host doesn't expose monitor sources.
+[target.'cfg(target_os = "linux")'.dependencies]
+cpal = { version = "0.18", features = ["pulseaudio"] }
+
+[dev-dependencies]
+env_logger = "0.11" # examples only: surface the library's `log` output
+
+# Building the huge `windows`/onnxruntime crates with full debuginfo can OOM
+# rustc on low-RAM machines; drop debuginfo for dependencies.
+[profile.dev.package."*"]
+debug = false

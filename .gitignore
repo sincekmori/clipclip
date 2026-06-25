@@ -1,0 +1,16 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+*.pdb
+
+# Library crate: the lockfile is intentionally not committed
+Cargo.lock
+
+# Example output (examples/save_to_disk.rs)
+/clipclip-out
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp

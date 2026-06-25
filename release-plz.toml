@@ -1,0 +1,6 @@
+[workspace]
+# CI already builds and tests on Linux, Windows, and macOS, so skip the
+# publish-time verification build. (It would otherwise run on the Linux release
+# runner, which would need ALSA dev headers + the bfd linker for the default
+# `opus` feature.)
+publish_no_verify = true

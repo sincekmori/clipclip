@@ -1,0 +1,15 @@
+# Forces the system GNU `ld` (bfd) for this crate's own builds on x86_64 Linux.
+#
+# opus-static-sys / libopusenc-static-sys compile the vendored libopus/libopusenc
+# with GCC `-flto`. Rust's default `rust-lld` linker can't resolve the resulting
+# `ope_*`/`opus_*` symbols from those LTO objects (it lacks the GCC LTO plugin),
+# so the `opus` feature fails to link under rust-lld — even with the
+# `+whole-archive` modifier build.rs adds. bfd (invoked via the gcc `cc` driver,
+# which loads the LTO plugin) links them correctly.
+#
+# This only affects builds run *inside this repo*: a dependency's
+# .cargo/config.toml does NOT propagate, so downstream projects that enable the
+# `opus` feature on Linux must add the same setting themselves (see README).
+# No effect on Windows/macOS, or on WAV-only (`default-features = false`) builds.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "linker-features=-lld"]

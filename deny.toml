@@ -1,0 +1,43 @@
+# cargo-deny configuration. See https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+ignore = [
+    # `paste` is archived/unmaintained. It is pulled in only transitively (e.g.
+    # via the ONNX/`ort` stack behind the `silero` feature); there is no
+    # vulnerability and no upgrade path from here. Revisit if it disappears.
+    "RUSTSEC-2024-0436",
+]
+
+[licenses]
+# Permissive licenses accepted in the dependency tree.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "BSL-1.0",
+    "NCSA",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+]
+confidence-threshold = 0.8
+# Keep forward-looking permissive entries above without warning when a given
+# license happens not to appear in the current tree.
+unused-allowed-license = "allow"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
