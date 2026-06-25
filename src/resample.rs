@@ -5,8 +5,13 @@
 //! residual and feed full chunks; leftover frames (< one chunk) wait for the
 //! next call. RAM is bounded: the residual is drained back below one chunk on
 //! every `process`.
+//!
+//! rubato 3.x replaced `FftFixedIn` with [`Fft`] + [`FixedSync::Input`] and reads
+//! / writes through the `audioadapter` buffer traits; for mono an interleaved
+//! single-channel slice is just the flat sample slice.
 
-use rubato::{FftFixedIn, Resampler};
+use rubato::audioadapter_buffers::direct::InterleavedSlice;
+use rubato::{Fft, FixedSync, Resampler};
 
 use crate::error::{Error, Result};
 
@@ -16,9 +21,9 @@ const CHUNK_IN: usize = 1024;
 
 pub struct StreamResampler {
     // `None` means input rate already equals output rate → pass-through.
-    inner: Option<FftFixedIn<f32>>,
+    inner: Option<Fft<f32>>,
     residual: Vec<f32>,
-    out_scratch: Vec<Vec<f32>>, // one channel (mono)
+    out_scratch: Vec<f32>, // mono, flat; len = output_frames_max
     chunk_in: usize,
 }
 
@@ -28,27 +33,25 @@ impl StreamResampler {
             return Ok(Self {
                 inner: None,
                 residual: Vec::new(),
-                out_scratch: vec![Vec::new()],
+                out_scratch: Vec::new(),
                 chunk_in: CHUNK_IN,
             });
         }
-        let inner = FftFixedIn::<f32>::new(
+        let inner = Fft::<f32>::new(
             in_rate as usize,
             out_rate as usize,
             CHUNK_IN,
             2, // sub_chunks
             1, // mono
+            FixedSync::Input,
         )
         .map_err(|e| Error::Resample(format!("{in_rate}->{out_rate}: {e}")))?;
 
         let out_max = inner.output_frames_max();
-        let mut residual = Vec::with_capacity(CHUNK_IN * 4);
-        residual.clear();
-
         Ok(Self {
             inner: Some(inner),
-            residual,
-            out_scratch: vec![vec![0.0f32; out_max]],
+            residual: Vec::with_capacity(CHUNK_IN * 4),
+            out_scratch: vec![0.0f32; out_max],
             chunk_in: CHUNK_IN,
         })
     }
@@ -63,11 +66,12 @@ impl StreamResampler {
 
         self.residual.extend_from_slice(input);
         while self.residual.len() >= self.chunk_in {
-            let wave_in = [&self.residual[..self.chunk_in]];
-            let (_consumed, produced) = resampler
-                .process_into_buffer(&wave_in, &mut self.out_scratch, None)
-                .map_err(|e| Error::Resample(e.to_string()))?;
-            out.extend_from_slice(&self.out_scratch[0][..produced]);
+            let produced = resample_chunk(
+                resampler,
+                &self.residual[..self.chunk_in],
+                &mut self.out_scratch,
+            )?;
+            out.extend_from_slice(&self.out_scratch[..produced]);
             self.residual.drain(0..self.chunk_in);
         }
         Ok(())
@@ -84,14 +88,33 @@ impl StreamResampler {
             return Ok(());
         }
         self.residual.resize(self.chunk_in, 0.0);
-        let wave_in = [&self.residual[..self.chunk_in]];
-        let (_c, produced) = resampler
-            .process_into_buffer(&wave_in, &mut self.out_scratch, None)
-            .map_err(|e| Error::Resample(e.to_string()))?;
-        out.extend_from_slice(&self.out_scratch[0][..produced]);
+        let produced = resample_chunk(
+            resampler,
+            &self.residual[..self.chunk_in],
+            &mut self.out_scratch,
+        )?;
+        out.extend_from_slice(&self.out_scratch[..produced]);
         self.residual.clear();
         Ok(())
     }
+}
+
+/// Run one fixed-size chunk through the resampler, returning how many output
+/// frames were written into `out_scratch`. Mono → one interleaved channel.
+fn resample_chunk(
+    resampler: &mut Fft<f32>,
+    input: &[f32],
+    out_scratch: &mut [f32],
+) -> Result<usize> {
+    let input_buf =
+        InterleavedSlice::new(input, 1, input.len()).map_err(|e| Error::Resample(e.to_string()))?;
+    let out_frames = out_scratch.len();
+    let mut output_buf = InterleavedSlice::new_mut(out_scratch, 1, out_frames)
+        .map_err(|e| Error::Resample(e.to_string()))?;
+    let (_consumed, produced) = resampler
+        .process_into_buffer(&input_buf, &mut output_buf, None)
+        .map_err(|e| Error::Resample(e.to_string()))?;
+    Ok(produced)
 }
 
 #[cfg(test)]

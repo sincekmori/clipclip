@@ -21,7 +21,7 @@ silero = ["dep:voice_activity_detector"]
 
 [dependencies]
 cpal = "0.18"          # cross-platform capture (mic + loopback)
-rubato = "0.16"        # sample-rate conversion
+rubato = "3.0"         # sample-rate conversion
 ringbuf = "0.5"        # lock-free SPSC ring buffer
 log = "0.4"
 thiserror = "2"
