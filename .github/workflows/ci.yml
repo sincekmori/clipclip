@@ -32,6 +32,13 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Include the runner image version in the cache key so a runner-image
+          # (e.g. Xcode) update invalidates the cache. Otherwise a restored
+          # `target/` keeps stale C-dependency linker paths from the previous
+          # image (libopus / onnxruntime, clang_rt.osx) and the macOS link step
+          # fails with "library 'clang_rt.osx' not found".
+          key: ${{ env.ImageVersion }}
       # ALSA headers are needed to build cpal on Linux. CMake (for the `opus`
       # feature's vendored libopus) is preinstalled on the GitHub runners.
       - name: install Linux audio deps
