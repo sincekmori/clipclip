@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/sincekmori/clipclip/compare/v0.1.1...v0.2.0) - 2026-06-25
+
+### Added
+
+- [**breaking**] separate mic/system tracks and ISO 8601 UTC segment timestamps
+
+### Other
+
+- key rust-cache on runner image version
+
 ## [0.1.1](https://github.com/sincekmori/clipclip/compare/v0.1.0...v0.1.1) - 2026-06-25
 
 ### Fixed
