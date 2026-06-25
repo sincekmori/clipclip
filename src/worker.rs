@@ -1,7 +1,7 @@
 //! The single worker/consumer thread: drains the capture ring buffer(s),
-//! resamples to the target rate, mixes (in `Both` mode), cuts fixed-length
-//! segments, runs the activity filter, encodes, and hands each kept segment to
-//! the user's handler.
+//! resamples to the target rate, mixes (in `Mixed` mode) or keeps the sources
+//! apart (in `Separate` mode), cuts fixed-length segments, runs the activity
+//! filter, encodes, and hands each kept segment to the user's handler.
 //!
 //! Memory is flat for the whole recording: fixed-capacity ring buffers + a small
 //! set of reused scratch/segment buffers. Nothing accumulates.
@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 
 use ringbuf::traits::{Consumer, Split};
 use ringbuf::{HeapCons, HeapRb};
@@ -20,7 +20,7 @@ use crate::config::{Config, Source};
 use crate::encode;
 use crate::error::{Error, Result};
 use crate::resample::StreamResampler;
-use crate::segment::Segment;
+use crate::segment::{iso8601_utc, Segment, Track};
 use crate::segmenter::Segmenter;
 use crate::vad::{make_detector, ActivityDetector};
 
@@ -32,6 +32,19 @@ const POP_SCRATCH: usize = 4096;
 const TICK: Duration = Duration::from_millis(20);
 /// Upper bound for user gain (~ +18 dB).
 const MAX_GAIN: f32 = 8.0;
+
+/// Clears the `running` flag when the worker exits — including on an unwinding
+/// panic out of the user's handler — so [`Recording::is_running`] can't get
+/// stuck reporting `true` after the worker thread has actually died.
+///
+/// [`Recording::is_running`]: crate::Recording::is_running
+struct RunningGuard(Arc<AtomicBool>);
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
 
 /// Live control messages sent to the worker.
 pub(crate) enum WorkerCommand {
@@ -99,7 +112,123 @@ fn open_source(
     })
 }
 
-/// Mix `Both` mode: mic is the clock master; add the next system sample (zero if
+/// One output track's tail of the pipeline: cut into fixed-length segments,
+/// gate on activity, number, timestamp, and deliver. There is one in single-track
+/// modes (`Mic` / `System` / `Mixed`) and two — mic and system — in `Separate`,
+/// each with its own `index` so the two streams number independently.
+struct TrackPipeline {
+    track: Track,
+    segmenter: Segmenter,
+    detector: Box<dyn ActivityDetector>,
+    index: u64,
+    /// Audio frames this track has completed windows for (kept *and* dropped).
+    frames_done: u64,
+    /// Audio frames ever pushed into this track's segmenter. The newest one was
+    /// captured ~`now` (this tick), so it ties the sample timeline to the clock.
+    pushed: u64,
+}
+
+impl TrackPipeline {
+    fn new(track: Track, cfg: &Config) -> Result<Self> {
+        Ok(Self {
+            track,
+            segmenter: Segmenter::new(cfg.segment_samples()),
+            detector: make_detector(&cfg.activity, cfg.sample_rate)?,
+            index: 0,
+            frames_done: 0,
+            pushed: 0,
+        })
+    }
+
+    /// Cut `samples` into segments, delivering each completed one. `now` is this
+    /// tick's wall clock (when these samples were captured); `is_final` tags
+    /// segments emitted while flushing the tail at stop.
+    fn push<H: FnMut(Segment)>(
+        &mut self,
+        samples: &[f32],
+        cfg: &Config,
+        handler: &mut H,
+        now: SystemTime,
+        is_final: bool,
+    ) {
+        self.pushed += samples.len() as u64;
+        // Destructure so the segmenter borrow stays disjoint from the detector /
+        // index / clock borrows the delivery closure needs.
+        let Self {
+            track,
+            segmenter,
+            detector,
+            index,
+            frames_done,
+            pushed,
+        } = self;
+        let (track, pushed) = (*track, *pushed);
+        segmenter.push(samples, |seg| {
+            deliver_segment(
+                seg,
+                track,
+                cfg,
+                &mut **detector,
+                handler,
+                index,
+                frames_done,
+                pushed,
+                now,
+                is_final,
+            );
+        });
+    }
+
+    /// Emit whatever partial segment remains (called once per track at stop).
+    fn flush<H: FnMut(Segment)>(&mut self, cfg: &Config, handler: &mut H, now: SystemTime) {
+        let Self {
+            track,
+            segmenter,
+            detector,
+            index,
+            frames_done,
+            pushed,
+        } = self;
+        let (track, pushed) = (*track, *pushed);
+        segmenter.flush(|seg| {
+            deliver_segment(
+                seg,
+                track,
+                cfg,
+                &mut **detector,
+                handler,
+                index,
+                frames_done,
+                pushed,
+                now,
+                true,
+            );
+        });
+    }
+}
+
+/// Get the pipeline in `slot`, creating it on first use. Returns `None` only if
+/// the (one-time) detector build fails — extremely unlikely once the initial
+/// pipelines have been built, so the track is simply skipped and logged rather
+/// than aborting a live recording.
+fn ensure_pipe<'a>(
+    slot: &'a mut Option<TrackPipeline>,
+    track: Track,
+    cfg: &Config,
+) -> Option<&'a mut TrackPipeline> {
+    if slot.is_none() {
+        match TrackPipeline::new(track, cfg) {
+            Ok(p) => *slot = Some(p),
+            Err(e) => {
+                log::error!("could not build {} activity detector: {e}", track.as_str());
+                return None;
+            }
+        }
+    }
+    slot.as_mut()
+}
+
+/// Mix `Mixed` mode: mic is the clock master; add the next system sample (zero if
 /// behind), clamping. The system residual is bounded (`cap`) so drift can't grow
 /// memory.
 fn mix_into(mic: &[f32], sys: &[f32], sys_residual: &mut Vec<f32>, out: &mut Vec<f32>, cap: usize) {
@@ -170,21 +299,35 @@ fn apply_source(
     }
 }
 
-/// Filter, encode, and deliver one finished segment to the handler.
+/// Filter, encode, timestamp, and deliver one finished segment to the handler.
+///
+/// Timestamps are read from the wall clock, not accumulated: `now` is the capture
+/// time of the newest pushed frame (index `pushed`); this window ends `pushed -
+/// (frames_done + n)` frames before it. So every segment re-anchors to the real
+/// clock — no drift builds up even if frames were dropped earlier.
 #[allow(clippy::too_many_arguments)]
 fn deliver_segment<H: FnMut(Segment)>(
     samples: &[f32],
+    track: Track,
     cfg: &Config,
     detector: &mut dyn ActivityDetector,
     handler: &mut H,
     index: &mut u64,
-    start: Instant,
+    frames_done: &mut u64,
+    pushed: u64,
+    now: SystemTime,
     is_final: bool,
 ) {
-    if is_final && samples.len() < cfg.min_final_samples() {
+    let n = samples.len();
+    // Advance the per-track frame count for *every* window (kept or dropped) so a
+    // dropped window doesn't shift the frame-to-clock mapping of later ones.
+    let frames_after = *frames_done + n as u64;
+    let pending = pushed.saturating_sub(frames_after); // frames captured after this window's end
+    *frames_done = frames_after;
+
+    if is_final && n < cfg.min_final_samples() {
         log::debug!(
-            "final segment dropped ({} frames < {} min)",
-            samples.len(),
+            "final segment dropped ({n} frames < {} min)",
             cfg.min_final_samples()
         );
         return;
@@ -200,17 +343,24 @@ fn deliver_segment<H: FnMut(Segment)>(
             return;
         }
     };
-    let frames = samples.len();
+    let rate = cfg.sample_rate as f64;
+    let end = now
+        .checked_sub(Duration::from_secs_f64(pending as f64 / rate))
+        .unwrap_or(now);
+    let start = end
+        .checked_sub(Duration::from_secs_f64(n as f64 / rate))
+        .unwrap_or(end);
     *index += 1;
     let seg = Segment {
+        track,
         index: *index,
         data,
         format: cfg.format,
         sample_rate: cfg.sample_rate,
         channels: 1,
-        frames,
-        duration: Duration::from_secs_f64(frames as f64 / cfg.sample_rate as f64),
-        offset: start.elapsed(),
+        frames: n,
+        start_time: iso8601_utc(start),
+        end_time: iso8601_utc(end),
         is_final,
     };
     handler(seg);
@@ -231,17 +381,22 @@ pub(crate) fn run<H>(
 ) where
     H: FnMut(Segment) + Send + 'static,
 {
+    // Clears `running` on every exit path — normal return, early error, or a
+    // panic unwinding out of the handler.
+    let _running_guard = RunningGuard(running);
+
     let rate = cfg.sample_rate;
     let mix_cap = rate as usize; // ~1 s of system residual at the output rate
 
-    let mut detector = match make_detector(&cfg.activity, rate) {
-        Ok(d) => d,
-        Err(e) => {
-            let _ = ready_tx.send(Err(e));
-            running.store(false, Ordering::Relaxed);
-            return;
-        }
-    };
+    // The active delivery mode; switchable live via `SetSource`.
+    let mut mode = cfg.source;
+    // One pipeline per output track. `Mic` / `System` / `Mixed` use exactly one;
+    // `Separate` uses `mic_pipe` + `sys_pipe`. The mode's initial pipeline(s) are
+    // built up front (below) so a detector-build failure aborts `start` rather
+    // than silently disabling the gate; live mode switches build lazily.
+    let mut mixed_pipe: Option<TrackPipeline> = None;
+    let mut mic_pipe: Option<TrackPipeline> = None;
+    let mut sys_pipe: Option<TrackPipeline> = None;
 
     let fault: Fault = Arc::new(Mutex::new(None));
     let mic_overruns = Arc::new(AtomicU64::new(0));
@@ -255,7 +410,6 @@ pub(crate) fn run<H>(
             Ok(s) => mic_state = Some(s),
             Err(e) => {
                 let _ = ready_tx.send(Err(e));
-                running.store(false, Ordering::Relaxed);
                 return;
             }
         }
@@ -265,10 +419,28 @@ pub(crate) fn run<H>(
             Ok(s) => sys_state = Some(s),
             Err(e) => {
                 let _ = ready_tx.send(Err(e));
-                running.store(false, Ordering::Relaxed);
                 return;
             }
         }
+    }
+
+    // Build the activity gate + segmenter for the track(s) this mode delivers,
+    // before signalling ready, so a detector-build failure surfaces from `start`.
+    let build = (|| -> Result<()> {
+        match mode {
+            Source::Mic => mic_pipe = Some(TrackPipeline::new(Track::Mic, &cfg)?),
+            Source::System => sys_pipe = Some(TrackPipeline::new(Track::System, &cfg)?),
+            Source::Mixed => mixed_pipe = Some(TrackPipeline::new(Track::Mixed, &cfg)?),
+            Source::Separate => {
+                mic_pipe = Some(TrackPipeline::new(Track::Mic, &cfg)?);
+                sys_pipe = Some(TrackPipeline::new(Track::System, &cfg)?);
+            }
+        }
+        Ok(())
+    })();
+    if let Err(e) = build {
+        let _ = ready_tx.send(Err(e));
+        return;
     }
 
     let _ = ready_tx.send(Ok(()));
@@ -277,31 +449,33 @@ pub(crate) fn run<H>(
     let mut sys16k: Vec<f32> = Vec::with_capacity(rate as usize);
     let mut mixed: Vec<f32> = Vec::with_capacity(rate as usize);
     let mut sys_residual: Vec<f32> = Vec::with_capacity(mix_cap);
-    let mut segmenter = Segmenter::new(cfg.segment_samples());
 
     let mut mic_gain = cfg.mic_gain.clamp(0.0, MAX_GAIN);
     let mut system_gain = cfg.system_gain.clamp(0.0, MAX_GAIN);
 
-    let mut index: u64 = 0;
     let mut last_overruns: u64 = 0;
-    let start = Instant::now();
 
     loop {
         let should_stop = stop.load(Ordering::Relaxed);
         let device_failed = fault.lock().map_or(true, |g| g.is_some());
+        // Anchor for any pipeline created this tick (a track just added live).
+        let now = SystemTime::now();
 
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
-                WorkerCommand::SetSource(s) => apply_source(
-                    s,
-                    rate,
-                    &mut mic_state,
-                    &mut sys_state,
-                    &mic_overruns,
-                    &sys_overruns,
-                    &fault,
-                    &mut sys_residual,
-                ),
+                WorkerCommand::SetSource(s) => {
+                    apply_source(
+                        s,
+                        rate,
+                        &mut mic_state,
+                        &mut sys_state,
+                        &mic_overruns,
+                        &sys_overruns,
+                        &fault,
+                        &mut sys_residual,
+                    );
+                    mode = s;
+                }
                 WorkerCommand::SetGains { mic, system } => {
                     mic_gain = mic.clamp(0.0, MAX_GAIN);
                     system_gain = system.clamp(0.0, MAX_GAIN);
@@ -319,27 +493,39 @@ pub(crate) fn run<H>(
         }
         scale_in_place(&mut mic16k, mic_gain);
         scale_in_place(&mut sys16k, system_gain);
-        let out: &[f32] = match (mic_state.is_some(), sys_state.is_some()) {
-            (true, true) => {
-                mix_into(&mic16k, &sys16k, &mut sys_residual, &mut mixed, mix_cap);
-                &mixed
-            }
-            (true, false) => &mic16k,
-            (false, true) => &sys16k,
-            (false, false) => &[],
-        };
 
-        segmenter.push(out, |seg| {
-            deliver_segment(
-                seg,
-                &cfg,
-                &mut *detector,
-                &mut handler,
-                &mut index,
-                start,
-                false,
-            )
-        });
+        if mode.is_separate() {
+            // Two independent tracks: each source is segmented and gated on its
+            // own. No mixing, no clock master — nothing is dropped to bound drift.
+            if mic_state.is_some() {
+                if let Some(p) = ensure_pipe(&mut mic_pipe, Track::Mic, &cfg) {
+                    p.push(&mic16k, &cfg, &mut handler, now, false);
+                }
+            }
+            if sys_state.is_some() {
+                if let Some(p) = ensure_pipe(&mut sys_pipe, Track::System, &cfg) {
+                    p.push(&sys16k, &cfg, &mut handler, now, false);
+                }
+            }
+        } else {
+            let (track, out): (Track, &[f32]) = match (mic_state.is_some(), sys_state.is_some()) {
+                (true, true) => {
+                    mix_into(&mic16k, &sys16k, &mut sys_residual, &mut mixed, mix_cap);
+                    (Track::Mixed, &mixed)
+                }
+                (true, false) => (Track::Mic, &mic16k),
+                (false, true) => (Track::System, &sys16k),
+                (false, false) => (Track::Mixed, &[]),
+            };
+            let slot = match track {
+                Track::Mixed => &mut mixed_pipe,
+                Track::Mic => &mut mic_pipe,
+                Track::System => &mut sys_pipe,
+            };
+            if let Some(p) = ensure_pipe(slot, track, &cfg) {
+                p.push(out, &cfg, &mut handler, now, false);
+            }
+        }
 
         let overruns = mic_overruns.load(Ordering::Relaxed) + sys_overruns.load(Ordering::Relaxed);
         if overruns != last_overruns {
@@ -374,37 +560,48 @@ pub(crate) fn run<H>(
     }
     scale_in_place(&mut mic16k, mic_gain);
     scale_in_place(&mut sys16k, system_gain);
-    let tail: &[f32] = match (mic_state.is_some(), sys_state.is_some()) {
-        (true, true) => {
-            mix_into(&mic16k, &sys16k, &mut sys_residual, &mut mixed, mix_cap);
-            &mixed
+
+    // Wall clock at stop; the drained tail's newest frame was captured ~now.
+    let now = SystemTime::now();
+    // Feed the drained tail into the current mode's pipeline(s) as final samples.
+    if mode.is_separate() {
+        if mic_state.is_some() {
+            if let Some(p) = ensure_pipe(&mut mic_pipe, Track::Mic, &cfg) {
+                p.push(&mic16k, &cfg, &mut handler, now, true);
+            }
         }
-        (true, false) => &mic16k,
-        (false, true) => &sys16k,
-        (false, false) => &[],
-    };
-    segmenter.push(tail, |seg| {
-        deliver_segment(
-            seg,
-            &cfg,
-            &mut *detector,
-            &mut handler,
-            &mut index,
-            start,
-            true,
-        )
-    });
-    segmenter.flush(|seg| {
-        deliver_segment(
-            seg,
-            &cfg,
-            &mut *detector,
-            &mut handler,
-            &mut index,
-            start,
-            true,
-        )
-    });
+        if sys_state.is_some() {
+            if let Some(p) = ensure_pipe(&mut sys_pipe, Track::System, &cfg) {
+                p.push(&sys16k, &cfg, &mut handler, now, true);
+            }
+        }
+    } else {
+        let (track, tail): (Track, &[f32]) = match (mic_state.is_some(), sys_state.is_some()) {
+            (true, true) => {
+                mix_into(&mic16k, &sys16k, &mut sys_residual, &mut mixed, mix_cap);
+                (Track::Mixed, &mixed)
+            }
+            (true, false) => (Track::Mic, &mic16k),
+            (false, true) => (Track::System, &sys16k),
+            (false, false) => (Track::Mixed, &[]),
+        };
+        let slot = match track {
+            Track::Mixed => &mut mixed_pipe,
+            Track::Mic => &mut mic_pipe,
+            Track::System => &mut sys_pipe,
+        };
+        if let Some(p) = ensure_pipe(slot, track, &cfg) {
+            p.push(tail, &cfg, &mut handler, now, true);
+        }
+    }
+
+    // Flush the partial remainder from every pipeline that was used — including
+    // one left from a pre-switch mode — so no buffered tail is lost.
+    for slot in [&mut mixed_pipe, &mut mic_pipe, &mut sys_pipe] {
+        if let Some(p) = slot.as_mut() {
+            p.flush(&cfg, &mut handler, now);
+        }
+    }
 
     // If a capture device faulted, report it as the terminal outcome so the
     // caller can tell a device loss apart from a clean stop.
@@ -414,38 +611,51 @@ pub(crate) fn run<H>(
         }
     }
 
-    log::info!("recording stopped: {index} segment(s) delivered");
-    running.store(false, Ordering::Relaxed);
+    let total: u64 = [&mixed_pipe, &mic_pipe, &sys_pipe]
+        .into_iter()
+        .filter_map(|p| p.as_ref().map(|p| p.index))
+        .sum();
+    log::info!("recording stopped: {total} segment(s) delivered");
+    // `running` is cleared by `_running_guard` on return.
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{Activity, Format};
-    use crate::vad::make_detector;
+    use std::time::UNIX_EPOCH;
+
+    fn cfg_1s() -> Config {
+        Config {
+            format: Format::Wav,
+            sample_rate: 16_000,
+            segment: Duration::from_secs(1),
+            min_final_segment: Duration::from_secs(3),
+            ..Config::default()
+        }
+    }
 
     /// Count how many segments `deliver_segment` hands to the handler for the
     /// given buffer/`is_final`, using a 3 s `min_final_segment` and the keep-all
     /// detector so only the length gate can drop anything.
     fn delivered(samples: &[f32], is_final: bool) -> usize {
-        let cfg = Config {
-            format: Format::Wav,
-            sample_rate: 16_000,
-            min_final_segment: Duration::from_secs(3),
-            ..Config::default()
-        };
+        let cfg = cfg_1s();
         let mut detector = make_detector(&Activity::KeepAll, cfg.sample_rate).unwrap();
-        let mut index = 0u64;
+        let (mut index, mut frames_done) = (0u64, 0u64);
+        let pushed = samples.len() as u64;
         let mut count = 0usize;
         {
             let mut handler = |_seg: Segment| count += 1;
             deliver_segment(
                 samples,
+                Track::Mic,
                 &cfg,
                 &mut *detector,
                 &mut handler,
                 &mut index,
-                Instant::now(),
+                &mut frames_done,
+                pushed,
+                UNIX_EPOCH,
                 is_final,
             );
         }
@@ -468,5 +678,129 @@ mod tests {
     fn min_final_only_applies_to_the_tail() {
         // 1 s but not final -> kept (full segments are never length-gated).
         assert_eq!(delivered(&vec![0.1f32; 16_000], false), 1);
+    }
+
+    #[test]
+    fn pipeline_tags_track_and_numbers_per_instance() {
+        let cfg = cfg_1s();
+        // Two pipelines stand in for the mic and system tracks.
+        let mut mic = TrackPipeline::new(Track::Mic, &cfg).unwrap();
+        let mut sys = TrackPipeline::new(Track::System, &cfg).unwrap();
+
+        let mut got: Vec<(Track, u64)> = Vec::new();
+        {
+            let mut handler = |seg: Segment| got.push((seg.track, seg.index));
+            // 2 s of mic -> two full 1 s segments; 1 s of system -> one.
+            mic.push(
+                &vec![0.2f32; 16_000 * 2],
+                &cfg,
+                &mut handler,
+                UNIX_EPOCH,
+                false,
+            );
+            sys.push(&vec![0.2f32; 16_000], &cfg, &mut handler, UNIX_EPOCH, false);
+        }
+
+        // Each track is tagged correctly and numbered from 1 independently.
+        assert_eq!(
+            got,
+            vec![(Track::Mic, 1), (Track::Mic, 2), (Track::System, 1)]
+        );
+    }
+
+    #[test]
+    fn timestamps_are_contiguous_within_a_batch() {
+        let cfg = cfg_1s(); // 1 s segments at 16 kHz
+        let mut mic = TrackPipeline::new(Track::Mic, &cfg).unwrap();
+        let mut got: Vec<(String, String)> = Vec::new();
+        {
+            let mut handler = |seg: Segment| got.push((seg.start_time, seg.end_time));
+            // 2 s captured up to t = epoch + 2 s -> two back-to-back 1 s windows
+            // ending at +1 s and +2 s, both read off that one clock value.
+            let now = UNIX_EPOCH + Duration::from_secs(2);
+            mic.push(&vec![0.2f32; 16_000 * 2], &cfg, &mut handler, now, false);
+        }
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "1970-01-01T00:00:00.000Z".to_string(),
+                    "1970-01-01T00:00:01.000Z".to_string()
+                ),
+                (
+                    "1970-01-01T00:00:01.000Z".to_string(),
+                    "1970-01-01T00:00:02.000Z".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn dropped_silent_window_does_not_shift_later_timestamps() {
+        // Energy gate: a silent 1 s window is dropped, but the next (loud) window
+        // is still timestamped at +1..+2 s — the drop doesn't pull it earlier.
+        let cfg = Config {
+            activity: Activity::energy(),
+            ..cfg_1s()
+        };
+        let mut mic = TrackPipeline::new(Track::Mic, &cfg).unwrap();
+        let mut got: Vec<(u64, String, String)> = Vec::new();
+        {
+            let mut handler = |seg: Segment| got.push((seg.index, seg.start_time, seg.end_time));
+            let mut buf = vec![0.0f32; 16_000]; // 1 s of silence -> dropped
+            buf.extend(vec![0.3f32; 16_000]); // 1 s of tone -> kept
+            let now = UNIX_EPOCH + Duration::from_secs(2);
+            mic.push(&buf, &cfg, &mut handler, now, false);
+        }
+        assert_eq!(
+            got,
+            vec![(
+                1,
+                "1970-01-01T00:00:01.000Z".to_string(),
+                "1970-01-01T00:00:02.000Z".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn timestamps_come_from_the_capture_clock() {
+        // Times track the wall clock passed in, not any fixed recording origin —
+        // so a track started live is correct from the moment its audio arrives.
+        let cfg = cfg_1s();
+        let mut sys = TrackPipeline::new(Track::System, &cfg).unwrap();
+        let mut got: Vec<(String, String)> = Vec::new();
+        {
+            let mut handler = |seg: Segment| got.push((seg.start_time, seg.end_time));
+            let now = UNIX_EPOCH + Duration::from_secs(300); // captured 5 min in
+            sys.push(&vec![0.2f32; 16_000], &cfg, &mut handler, now, false);
+        }
+        assert_eq!(
+            got,
+            vec![(
+                "1970-01-01T00:04:59.000Z".to_string(),
+                "1970-01-01T00:05:00.000Z".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn running_guard_clears_flag_on_drop() {
+        // However the worker exits (incl. a handler panic unwinding through it),
+        // the guard's Drop flips `running` to false.
+        let flag = Arc::new(AtomicBool::new(true));
+        {
+            let _g = RunningGuard(flag.clone());
+            assert!(flag.load(Ordering::Relaxed));
+        }
+        assert!(!flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn source_predicates() {
+        assert!(Source::Separate.needs_mic() && Source::Separate.needs_system());
+        assert!(Source::Mixed.needs_mic() && Source::Mixed.needs_system());
+        assert!(Source::Separate.is_separate());
+        assert!(!Source::Mixed.is_separate());
+        assert!(Source::Mic.needs_mic() && !Source::Mic.needs_system());
     }
 }

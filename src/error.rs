@@ -35,6 +35,12 @@ pub enum Error {
     /// A live-control call was made but the recording is not running.
     #[error("recording is not running")]
     NotRunning,
+    /// The recording worker thread terminated unexpectedly — almost always
+    /// because the handler panicked. Reported by [`Recording::stop`].
+    ///
+    /// [`Recording::stop`]: crate::Recording::stop
+    #[error("recording worker thread panicked (the handler likely panicked)")]
+    WorkerPanicked,
     /// Capture did not come up within the start timeout.
     #[error("timed out starting audio capture")]
     StartTimeout,

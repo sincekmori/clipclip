@@ -5,7 +5,10 @@
 //! the bytes to an LLM, upload them, etc.
 //!
 //! Usage:
-//!   cargo run --example save_to_disk -- [seconds] [mic|system|both] [opus|wav]
+//!   cargo run --example save_to_disk -- [seconds] [mic|system|mixed|separate] [opus|wav]
+//!
+//! With `separate`, mic and system audio arrive as two interleaved streams; the
+//! files are named by track (`segment_mic_0001`, `segment_system_0001`, …).
 
 use std::fs;
 use std::path::PathBuf;
@@ -20,7 +23,8 @@ fn main() {
     let secs: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(60);
     let source = match args.get(2).map(String::as_str) {
         Some("system") => Source::System,
-        Some("both") => Source::Both,
+        Some("mixed") | Some("both") => Source::Mixed,
+        Some("separate") => Source::Separate,
         _ => Source::Mic,
     };
 
@@ -44,17 +48,20 @@ fn main() {
     );
 
     let recording = start(config, move |segment| {
+        // Name files by track so the two `separate` streams don't collide.
         let path = out.join(format!(
-            "segment_{:04}.{}",
+            "segment_{}_{:04}.{}",
+            segment.track.as_str(),
             segment.index,
             segment.extension()
         ));
         match fs::write(&path, &segment.data) {
             Ok(()) => println!(
-                "saved {} ({} bytes, {:.1}s{})",
+                "saved {} ({} bytes, {}–{}{})",
                 path.display(),
                 segment.data.len(),
-                segment.duration.as_secs_f32(),
+                segment.start_time,
+                segment.end_time,
                 if segment.is_final { ", final" } else { "" },
             ),
             Err(e) => eprintln!("failed to write {}: {e}", path.display()),

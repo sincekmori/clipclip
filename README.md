@@ -7,7 +7,7 @@
 
 Continuously capture audio and hand fixed-length **Opus**/**WAV** segments to your code.
 
-`clipclip` records the **microphone**, **system audio (loopback)**, or **both mixed**, and — while recording without interruption — cuts the stream into segments of a configurable length (default 30s), encodes each one, and calls your handler with the encoded bytes.
+`clipclip` records the **microphone**, **system audio (loopback)**, **both mixed** into one track, or **both kept separate** as two tracks, and — while recording without interruption — cuts the stream into segments of a configurable length (default 30s), encodes each one, and calls your handler with the encoded bytes.
 What you do next is up to you: transcribe with Whisper, send to an LLM, upload, save to disk… `clipclip` itself never touches the filesystem.
 
 Audio is captured with [`cpal`](https://docs.rs/cpal), resampled to 16 kHz mono by default (ideal for ASR), and can optionally drop silent / no-speech segments before they reach your handler.
@@ -27,10 +27,12 @@ let recording = start(
     |segment| {
         // Hand the encoded bytes downstream (Whisper, an LLM, upload, save…).
         println!(
-            "segment #{}: {} bytes (.{})",
+            "{:?} #{}: {} bytes ({}–{})",
+            segment.track,
             segment.index,
             segment.data.len(),
-            segment.extension(),
+            segment.start_time, // ISO 8601 UTC, e.g. 2026-06-25T01:23:45.000Z
+            segment.end_time,
         );
     },
 )?;
@@ -51,17 +53,25 @@ Each `Segment` carries the encoded bytes plus metadata:
 
 ```text
 pub struct Segment {
-    pub index: u64,        // 1-based sequence number
-    pub data: Vec<u8>,     // a complete, standalone .opus or .wav file
+    pub track: Track,        // Mixed | Mic | System — which source this is
+    pub index: u64,          // 1-based sequence number, counted per track
+    pub data: Vec<u8>,       // a complete, standalone .opus or .wav file
     pub format: Format,
     pub sample_rate: u32,
-    pub channels: u16,     // 1 (mono)
-    pub frames: usize,     // samples per channel
-    pub duration: Duration,
-    pub offset: Duration,  // time from the start of recording
-    pub is_final: bool,    // the flushed tail at stop
+    pub channels: u16,       // 1 (mono)
+    pub frames: usize,       // samples per channel
+    pub start_time: String,  // ISO 8601 / RFC 3339, UTC, e.g. "2026-06-25T01:23:45.678Z"
+    pub end_time: String,    // ISO 8601 / RFC 3339, UTC
+    pub is_final: bool,      // the flushed tail at stop
 }
 ```
+
+With `Source::Separate`, your handler receives two interleaved streams; `segment.track` (`Track::Mic` / `Track::System`) tells them apart, and each track is numbered from 1 independently.
+
+`start_time` / `end_time` are wall-clock timestamps in **UTC**, formatted as ISO 8601 / RFC 3339 with millisecond precision.
+They are read from the system clock as each segment completes — not accumulated from the recording start — so they never drift over a long recording and stay correct even if some audio was dropped (e.g. a slow handler) or a track was added mid-recording.
+Expect a few milliseconds of jitter between one segment's `end_time` and the next's `start_time`.
+Align the `Mic` and `System` streams of a `Separate` recording by these timestamps.
 
 ## Configuration
 
@@ -70,7 +80,7 @@ use clipclip::{Config, Source, Format, Activity};
 use std::time::Duration;
 
 let cfg = Config {
-    source: Source::Both,                 // Mic | System | Both
+    source: Source::Mixed,                // Mic | System | Mixed | Separate
     segment: Duration::from_secs(15),     // any length; default 30s
     format: Format::Wav,                  // Format::Opus (default) | Format::Wav
     activity: Activity::silero(),          // KeepAll (default) | energy() | silero()
@@ -82,6 +92,10 @@ let cfg = Config {
 };
 ```
 
+- **Source / track layout**:
+  - `Source::Mic` / `Source::System` — one source, one stream.
+  - `Source::Mixed` — mic + system summed into one mono track (`Track::Mixed`).
+  - `Source::Separate` — mic + system kept apart as two streams (`Track::Mic`, `Track::System`), each segmented, filtered, and numbered on its own. Use this to transcribe or process the two sources independently (e.g. speaker vs. caller); align them by `start_time` / `end_time`. Mixing's clock-master/drift handling does not apply — neither stream's samples are dropped to stay aligned.
 - **Activity filtering** (drop segments before they reach your handler):
   - `Activity::KeepAll` *(default)* — hand off every segment.
   - `Activity::energy()` — dependency-free RMS gate (drops silence; lets steady noise through).
@@ -93,7 +107,7 @@ let cfg = Config {
   `recording.is_running()` then returns `false`, and `recording.stop()` returns `Err(Error::DeviceLost(..))` so you can tell a fault apart from a clean stop.
   Note: Linux/PulseAudio transparently reroutes an unplugged device to a fallback input, so a mic unplug usually does **not** surface as a fault there — recording continues from the fallback.
 - **Live control** while recording, via the `Recording` handle:
-  - `recording.set_source(Source::Both)` — add/remove sources on the fly.
+  - `recording.set_source(Source::Separate)` — add/remove sources, or switch between mixed and separate, on the fly.
   - `recording.set_gains(mic, system)` — adjust levels live.
 
 ## Cargo features
@@ -141,4 +155,5 @@ WAV-only builds — `default-features = false` — have no native dependency and
 # Save segments to ./clipclip-out/ for 60s (downstream stub):
 cargo run --example save_to_disk -- 60 mic
 cargo run --example save_to_disk -- 30 system wav
+cargo run --example save_to_disk -- 30 separate wav   # two streams: segment_mic_*, segment_system_*
 ```

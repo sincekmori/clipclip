@@ -20,7 +20,7 @@ use std::time::Duration;
 
 pub use config::{Activity, Config, Format, Source};
 pub use error::{Error, Result};
-pub use segment::Segment;
+pub use segment::{Segment, Track};
 
 use worker::WorkerCommand;
 
@@ -97,8 +97,9 @@ impl Recording {
     ///
     /// Returns [`Err`] with [`Error::DeviceLost`] if recording had already
     /// stopped because a capture device faulted (e.g. the microphone was
-    /// unplugged); otherwise [`Ok`]. Dropping the handle instead stops the same
-    /// way but discards this outcome.
+    /// unplugged), or [`Error::WorkerPanicked`] if the worker thread died
+    /// unexpectedly (almost always a panic in your handler); otherwise [`Ok`].
+    /// Dropping the handle instead stops the same way but discards this outcome.
     pub fn stop(mut self) -> Result<()> {
         self.shutdown();
         match self.outcome.lock() {
@@ -107,14 +108,18 @@ impl Recording {
         }
     }
 
-    /// Whether the worker is still capturing (false after [`stop`](Self::stop)
-    /// or a fatal device error).
+    /// Whether the worker is still capturing (false after [`stop`](Self::stop),
+    /// a fatal device error, or a panic in your handler).
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Relaxed)
     }
 
-    /// Switch the active source(s) live. Streams are opened/closed on the fly;
-    /// the session and segment timing continue uninterrupted.
+    /// Switch the active source(s) live, including between
+    /// [`Source::Mixed`] and [`Source::Separate`]. Streams are opened/closed on
+    /// the fly; the session and segment timing continue uninterrupted. Because
+    /// [`Segment`] timestamps are read from the wall clock as each segment
+    /// completes, a track added by the switch is timestamped correctly from the
+    /// moment its audio arrives.
     pub fn set_source(&self, source: Source) -> Result<()> {
         self.commands
             .send(WorkerCommand::SetSource(source))
@@ -131,7 +136,13 @@ impl Recording {
     fn shutdown(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(join) = self.join.take() {
-            let _ = join.join();
+            if join.join().is_err() {
+                // The worker thread unwound (most likely the handler panicked).
+                // Surface it through `stop()` rather than swallowing it.
+                if let Ok(mut slot) = self.outcome.lock() {
+                    slot.get_or_insert(Error::WorkerPanicked);
+                }
+            }
         }
     }
 }

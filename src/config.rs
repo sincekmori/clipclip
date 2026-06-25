@@ -4,23 +4,48 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 
-/// Which audio source(s) to capture.
+/// Which audio source(s) to capture, and how to deliver them.
+///
+/// The variant fully describes what your handler receives: [`Mic`](Source::Mic),
+/// [`System`](Source::System), and [`Mixed`](Source::Mixed) each produce a single
+/// stream of segments, while [`Separate`](Source::Separate) produces two — one
+/// per source. Each delivered [`Segment`](crate::Segment) is tagged with its
+/// [`Track`](crate::Track).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
-    /// Microphone (default input device).
+    /// Microphone only (default input device). One stream ([`Track::Mic`]).
+    ///
+    /// [`Track::Mic`]: crate::Track::Mic
     Mic,
-    /// System / speaker audio (loopback).
+    /// System / speaker audio only (loopback). One stream ([`Track::System`]).
+    ///
+    /// [`Track::System`]: crate::Track::System
     System,
-    /// Microphone + system audio, mixed into one mono track.
-    Both,
+    /// Microphone + system audio summed into one mono track ([`Track::Mixed`]).
+    ///
+    /// [`Track::Mixed`]: crate::Track::Mixed
+    Mixed,
+    /// Microphone + system audio kept apart as two independent streams
+    /// ([`Track::Mic`] and [`Track::System`]). Each is segmented, filtered, and
+    /// numbered on its own, so your handler is called separately for each — use
+    /// [`Segment::track`](crate::Segment::track) to tell them apart.
+    ///
+    /// [`Track::Mic`]: crate::Track::Mic
+    /// [`Track::System`]: crate::Track::System
+    Separate,
 }
 
 impl Source {
     pub(crate) fn needs_mic(self) -> bool {
-        matches!(self, Source::Mic | Source::Both)
+        matches!(self, Source::Mic | Source::Mixed | Source::Separate)
     }
     pub(crate) fn needs_system(self) -> bool {
-        matches!(self, Source::System | Source::Both)
+        matches!(self, Source::System | Source::Mixed | Source::Separate)
+    }
+    /// True when the two sources are delivered as separate streams rather than
+    /// summed into one.
+    pub(crate) fn is_separate(self) -> bool {
+        matches!(self, Source::Separate)
     }
 }
 
@@ -86,7 +111,7 @@ impl Activity {
 /// use std::time::Duration;
 ///
 /// let cfg = Config {
-///     source: Source::Both,
+///     source: Source::Separate,
 ///     segment: Duration::from_secs(10),
 ///     ..Config::default()
 /// };
@@ -103,9 +128,11 @@ pub struct Config {
     pub activity: Activity,
     /// Output sample rate (mono). Default 16000 (ideal for ASR like Whisper).
     pub sample_rate: u32,
-    /// Linear mic gain before mixing (1.0 = unchanged).
+    /// Linear gain applied to the mic source, before mixing or segmenting
+    /// (1.0 = unchanged).
     pub mic_gain: f32,
-    /// Linear system-audio gain before mixing (1.0 = unchanged).
+    /// Linear gain applied to the system-audio source, before mixing or
+    /// segmenting (1.0 = unchanged).
     pub system_gain: f32,
     /// Opus VBR bitrate in bits/s (only used for [`Format::Opus`]). Default 24000.
     pub opus_bitrate: u32,
