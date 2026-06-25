@@ -38,7 +38,12 @@ jobs:
           # `target/` keeps stale C-dependency linker paths from the previous
           # image (libopus / onnxruntime, clang_rt.osx) and the macOS link step
           # fails with "library 'clang_rt.osx' not found".
-          key: ${{ env.ImageVersion }}
+          #
+          # `env-vars` hashes the *values* of these runner-set variables into the
+          # key. A `${{ env.ImageVersion }}` expression does NOT work here: the
+          # `env` context only exposes workflow-defined vars, not runner-injected
+          # ones like ImageVersion, so it resolves to an empty (no-op) key.
+          env-vars: "ImageOS ImageVersion"
       # ALSA headers are needed to build cpal on Linux. CMake (for the `opus`
       # feature's vendored libopus) is preinstalled on the GitHub runners.
       - name: install Linux audio deps
