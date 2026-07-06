@@ -110,6 +110,31 @@ let cfg = Config {
   - `recording.set_source(Source::Separate)` — add/remove sources, or switch between mixed and separate, on the fly.
   - `recording.set_gains(mic, system)` — adjust levels live.
 
+## Live frame tap
+
+Segments arrive with seconds of latency by design. When something also needs the audio *as it is captured* — e.g. feeding a streaming speech-to-text API while segments remain the durable fallback — attach a frame tap with `start_with_tap`:
+
+```rust,no_run
+use clipclip::{start_with_tap, Config, Frames};
+
+let recording = start_with_tap(
+    Config::default(),
+    |segment| println!("segment #{} arrives as usual", segment.index),
+    Box::new(|frames: Frames<'_>| {
+        // Post-gain mono f32 samples at Config::sample_rate, every ~20 ms tick.
+        // Runs on the worker thread between device drains — hand the data off
+        // (channel, ring buffer) and return fast.
+        let _ = (frames.samples, frames.sample_rate, frames.captured_at);
+    }),
+)?;
+recording.stop()?;
+# Ok::<(), clipclip::Error>(())
+```
+
+The tap is always exactly one mono stream: when more than one source is active you get their sum (the `Mixed` policy), regardless of the configured `Source`.
+`frames.captured_at` is the wall-clock capture time of the newest sample in each delivery, so mapping sample offsets to real time never accumulates drift.
+Segment delivery is completely unaffected, and without a tap there is zero overhead — no tap buffers exist at all.
+
 ## Cargo features
 
 | Feature | Default | What it adds | Build needs |

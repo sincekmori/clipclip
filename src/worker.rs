@@ -22,6 +22,7 @@ use crate::error::{Error, Result};
 use crate::resample::StreamResampler;
 use crate::segment::{iso8601_utc, Segment, Track};
 use crate::segmenter::Segmenter;
+use crate::tap::{FrameTap, Frames};
 use crate::vad::{make_detector, ActivityDetector};
 
 /// ~4 s of headroom at 48 kHz mono. Fixed at startup, never grows.
@@ -247,6 +248,64 @@ fn mix_into(mic: &[f32], sys: &[f32], sys_residual: &mut Vec<f32>, out: &mut Vec
     }
 }
 
+/// Tap-owned mix state, needed only in `Separate` mode (the delivery path
+/// keeps the tracks apart there, but the tap contract is one mono stream).
+/// Starts empty — no memory is spent until a tap actually needs the mix.
+#[derive(Default)]
+struct TapMix {
+    residual: Vec<f32>,
+    mixed: Vec<f32>,
+}
+
+/// `Separate`-mode tap delivery: sum the active sources (mic as clock master,
+/// the same policy as `Mixed`) into tap-owned buffers, or pass a single active
+/// source through borrowed as-is. In the single-track modes the tap instead
+/// reuses the delivery buffer directly — zero extra work, zero extra memory.
+#[allow(clippy::too_many_arguments)]
+fn tap_separate(
+    tap: &mut FrameTap,
+    mix: &mut TapMix,
+    mic: &[f32],
+    sys: &[f32],
+    mic_active: bool,
+    sys_active: bool,
+    mix_cap: usize,
+    sample_rate: u32,
+    now: SystemTime,
+) {
+    let samples: &[f32] = match (mic_active, sys_active) {
+        (true, true) => {
+            mix_into(mic, sys, &mut mix.residual, &mut mix.mixed, mix_cap);
+            &mix.mixed
+        }
+        (true, false) => mic,
+        (false, true) => sys,
+        (false, false) => &[],
+    };
+    if samples.is_empty() {
+        return;
+    }
+    tap(Frames {
+        samples,
+        sample_rate,
+        captured_at: now,
+    });
+}
+
+/// Single-track tap delivery: the delivery buffer already is the one mono
+/// stream the tap wants, so it is borrowed as-is.
+fn tap_single(tap: &mut Option<FrameTap>, samples: &[f32], sample_rate: u32, now: SystemTime) {
+    let Some(tap) = tap.as_mut() else { return };
+    if samples.is_empty() {
+        return;
+    }
+    tap(Frames {
+        samples,
+        sample_rate,
+        captured_at: now,
+    });
+}
+
 /// Apply a linear gain in place (clamped). No-op for unity gain.
 fn scale_in_place(buf: &mut [f32], gain: f32) {
     if (gain - 1.0).abs() > f32::EPSILON {
@@ -373,6 +432,7 @@ fn deliver_segment<H: FnMut(Segment)>(
 pub(crate) fn run<H>(
     cfg: Config,
     mut handler: H,
+    mut tap: Option<FrameTap>,
     stop: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
     outcome: Arc<Mutex<Option<Error>>>,
@@ -449,6 +509,8 @@ pub(crate) fn run<H>(
     let mut sys16k: Vec<f32> = Vec::with_capacity(rate as usize);
     let mut mixed: Vec<f32> = Vec::with_capacity(rate as usize);
     let mut sys_residual: Vec<f32> = Vec::with_capacity(mix_cap);
+    // Empty until a tap actually needs a Separate-mode mix (see TapMix).
+    let mut tap_mix = TapMix::default();
 
     let mut mic_gain = cfg.mic_gain.clamp(0.0, MAX_GAIN);
     let mut system_gain = cfg.system_gain.clamp(0.0, MAX_GAIN);
@@ -495,6 +557,21 @@ pub(crate) fn run<H>(
         scale_in_place(&mut sys16k, system_gain);
 
         if mode.is_separate() {
+            // The delivery path keeps the tracks apart, so only here does the
+            // tap need its own one-stream mix.
+            if let Some(t) = tap.as_mut() {
+                tap_separate(
+                    t,
+                    &mut tap_mix,
+                    &mic16k,
+                    &sys16k,
+                    mic_state.is_some(),
+                    sys_state.is_some(),
+                    mix_cap,
+                    rate,
+                    now,
+                );
+            }
             // Two independent tracks: each source is segmented and gated on its
             // own. No mixing, no clock master — nothing is dropped to bound drift.
             if mic_state.is_some() {
@@ -517,6 +594,8 @@ pub(crate) fn run<H>(
                 (false, true) => (Track::System, &sys16k),
                 (false, false) => (Track::Mixed, &[]),
             };
+            // The delivery buffer already is the tap's one mono stream.
+            tap_single(&mut tap, out, rate, now);
             let slot = match track {
                 Track::Mixed => &mut mixed_pipe,
                 Track::Mic => &mut mic_pipe,
@@ -563,8 +642,22 @@ pub(crate) fn run<H>(
 
     // Wall clock at stop; the drained tail's newest frame was captured ~now.
     let now = SystemTime::now();
-    // Feed the drained tail into the current mode's pipeline(s) as final samples.
+    // Feed the drained tail into the current mode's pipeline(s) as final
+    // samples; the tap gets the tail too (the last words matter most live).
     if mode.is_separate() {
+        if let Some(t) = tap.as_mut() {
+            tap_separate(
+                t,
+                &mut tap_mix,
+                &mic16k,
+                &sys16k,
+                mic_state.is_some(),
+                sys_state.is_some(),
+                mix_cap,
+                rate,
+                now,
+            );
+        }
         if mic_state.is_some() {
             if let Some(p) = ensure_pipe(&mut mic_pipe, Track::Mic, &cfg) {
                 p.push(&mic16k, &cfg, &mut handler, now, true);
@@ -585,6 +678,7 @@ pub(crate) fn run<H>(
             (false, true) => (Track::System, &sys16k),
             (false, false) => (Track::Mixed, &[]),
         };
+        tap_single(&mut tap, tail, rate, now);
         let slot = match track {
             Track::Mixed => &mut mixed_pipe,
             Track::Mic => &mut mic_pipe,
@@ -802,5 +896,72 @@ mod tests {
         assert!(Source::Separate.is_separate());
         assert!(!Source::Mixed.is_separate());
         assert!(Source::Mic.needs_mic() && !Source::Mic.needs_system());
+    }
+
+    #[test]
+    fn separate_tap_mixes_into_one_mono_stream() {
+        let got: Arc<Mutex<Vec<Vec<f32>>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = got.clone();
+        let mut tap: FrameTap = Box::new(move |f: Frames<'_>| {
+            assert_eq!(f.sample_rate, 16_000);
+            sink.lock().unwrap().push(f.samples.to_vec());
+        });
+        let mut mix = TapMix::default();
+        let now = SystemTime::now();
+
+        // both sources active: summed, mic as clock master
+        tap_separate(
+            &mut tap,
+            &mut mix,
+            &[0.5, 0.5],
+            &[0.25, -0.25],
+            true,
+            true,
+            16_000,
+            16_000,
+            now,
+        );
+        // only the mic active: passthrough, the mix buffers stay untouched
+        tap_separate(
+            &mut tap,
+            &mut mix,
+            &[0.1],
+            &[],
+            true,
+            false,
+            16_000,
+            16_000,
+            now,
+        );
+        // no samples this tick: no delivery
+        tap_separate(
+            &mut tap,
+            &mut mix,
+            &[],
+            &[],
+            true,
+            true,
+            16_000,
+            16_000,
+            now,
+        );
+
+        assert_eq!(*got.lock().unwrap(), vec![vec![0.75, 0.25], vec![0.1]]);
+    }
+
+    #[test]
+    fn single_tap_borrows_the_delivery_buffer_and_none_is_a_noop() {
+        let got: Arc<Mutex<Vec<Vec<f32>>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = got.clone();
+        let mut tap: Option<FrameTap> = Some(Box::new(move |f: Frames<'_>| {
+            sink.lock().unwrap().push(f.samples.to_vec());
+        }));
+        let now = SystemTime::now();
+        tap_single(&mut tap, &[0.5, -0.5], 16_000, now);
+        tap_single(&mut tap, &[], 16_000, now); // empty tick: no delivery
+        assert_eq!(*got.lock().unwrap(), vec![vec![0.5, -0.5]]);
+
+        let mut none: Option<FrameTap> = None;
+        tap_single(&mut none, &[0.5], 16_000, now); // no tap: no-op
     }
 }

@@ -9,6 +9,7 @@ mod error;
 mod resample;
 mod segment;
 mod segmenter;
+mod tap;
 mod vad;
 mod worker;
 
@@ -21,6 +22,7 @@ use std::time::Duration;
 pub use config::{Activity, Config, Format, Source};
 pub use error::{Error, Result};
 pub use segment::{Segment, Track};
+pub use tap::{FrameTap, Frames};
 
 use worker::WorkerCommand;
 
@@ -40,6 +42,26 @@ pub fn start<H>(config: Config, handler: H) -> Result<Recording>
 where
     H: FnMut(Segment) + Send + 'static,
 {
+    start_inner(config, handler, None)
+}
+
+/// Like [`start`], additionally delivering raw audio frames to `tap` as they
+/// are captured (see [`Frames`] for the exact contract). The segment pipeline
+/// is unaffected: segments keep being cut, gated and delivered to `handler`.
+///
+/// The tap runs on the worker thread between device drains — hand the data off
+/// and return quickly (see [`FrameTap`]).
+pub fn start_with_tap<H>(config: Config, handler: H, tap: FrameTap) -> Result<Recording>
+where
+    H: FnMut(Segment) + Send + 'static,
+{
+    start_inner(config, handler, Some(tap))
+}
+
+fn start_inner<H>(config: Config, handler: H, tap: Option<FrameTap>) -> Result<Recording>
+where
+    H: FnMut(Segment) + Send + 'static,
+{
     config.validate()?;
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -55,7 +77,7 @@ where
         .name("clipclip-worker".into())
         .spawn(move || {
             worker::run(
-                config, handler, stop_w, running_w, outcome_w, ready_tx, cmd_rx,
+                config, handler, tap, stop_w, running_w, outcome_w, ready_tx, cmd_rx,
             )
         })
         .map_err(Error::Io)?;
