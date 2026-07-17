@@ -41,7 +41,6 @@ impl StreamResampler {
             in_rate as usize,
             out_rate as usize,
             CHUNK_IN,
-            2, // sub_chunks
             1, // mono
             FixedSync::Input,
         )
