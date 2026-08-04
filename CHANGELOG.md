@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4](https://github.com/sincekmori/clipclip/compare/v0.2.3...v0.2.4) - 2026-08-04
+
+### Fixed
+
+- remove sub_chunks argument from Fft::new for rubato 4.0
+
+### Other
+
+- *(deps)* update rubato requirement in the cargo group
+
 ## [0.2.3](https://github.com/sincekmori/clipclip/compare/v0.2.2...v0.2.3) - 2026-07-08
 
 ### Other
