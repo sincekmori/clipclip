@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5](https://github.com/sincekmori/clipclip/compare/v0.2.4...v0.2.5) - 2026-08-07
+
+### Other
+
+- *(deps)* bump crate-ci/typos in the actions group
+
 ## [0.2.4](https://github.com/sincekmori/clipclip/compare/v0.2.3...v0.2.4) - 2026-08-04
 
 ### Fixed
