@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6](https://github.com/sincekmori/clipclip/compare/v0.2.5...v0.2.6) - 2026-09-04
+
+### Fixed
+
+- use as_chunks instead of chunks_exact in Silero VAD to satisfy clippy on Rust 1.98
+
+### Other
+
+- Merge branch 'main' into dependabot/github_actions/actions-d82e01f320
+- *(deps)* update rubato requirement in the cargo group
+
 ## [0.2.5](https://github.com/sincekmori/clipclip/compare/v0.2.4...v0.2.5) - 2026-08-07
 
 ### Other
