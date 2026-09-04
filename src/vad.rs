@@ -93,14 +93,13 @@ impl ActivityDetector for SileroVad {
     fn is_active(&mut self, samples: &[f32]) -> bool {
         let mut active = 0usize;
         let mut total = 0usize;
-        let mut chunks = samples.chunks_exact(Self::WINDOW);
-        for w in &mut chunks {
+        let (windows, rem) = samples.as_chunks::<{ Self::WINDOW }>();
+        for w in windows {
             total += 1;
             if self.vad.predict(w.to_vec()) > self.threshold {
                 active += 1;
             }
         }
-        let rem = chunks.remainder();
         if !rem.is_empty() {
             total += 1;
             let mut padded = vec![0.0f32; Self::WINDOW];
