@@ -4,6 +4,9 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    # Wait 7 days after a release before proposing it (supply chain mitigation).
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
     groups:
       cargo:
@@ -13,6 +16,9 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    # Wait 7 days after a release before proposing it (supply chain mitigation).
+    cooldown:
+      default-days: 7
     groups:
       actions:
         patterns: ["*"]
