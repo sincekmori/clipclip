@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.7](https://github.com/sincekmori/clipclip/compare/v0.2.6...v0.2.7) - 2026-11-05
+
+### Added
+
+- add iOS/Android support with UnsupportedSource for loopback, a mobile stall watchdog, mobile CI targets and platform docs
+
+### Other
+
+- Merge pull request #21 from sincekmori/ci/dependabot-cooldown
+- Merge pull request #18 from sincekmori/dependabot/github_actions/actions-de1fe4fb2d
+- shorten the Dependabot cooldown from 7 days to 1 day
+- make Dependabot wait 7 days after a release before proposing it
+- install libasound2-dev in both release-plz jobs so cargo-semver-checks and cargo publish can build alsa-sys
+- Merge pull request #17 from sincekmori/dependabot/cargo/cargo-360f3efcdf
+- read ANDROID_NDK_LATEST_HOME from the shell since runner env vars are not in the env context
+- *(deps)* bump crate-ci/typos
+- *(deps)* update ringbuf requirement
+- *(deps)* bump crate-ci/typos in the actions group
+
 ## [0.2.6](https://github.com/sincekmori/clipclip/compare/v0.2.5...v0.2.6) - 2026-09-04
 
 ### Fixed
