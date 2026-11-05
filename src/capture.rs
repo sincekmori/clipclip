@@ -100,7 +100,24 @@ where
         build_stream(&device, supported, producer, overruns, fault, "system")
     }
 
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    // Unreachable in practice on iOS/Android: `Source::ensure_supported`
+    // rejects system-audio sources before capture is ever opened. Kept as a
+    // defensive backstop with the same clear error.
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    {
+        let _ = (producer, overruns, fault);
+        Err(Error::UnsupportedSource(
+            "system audio (loopback) cannot be captured on iOS/Android; use Source::Mic",
+        ))
+    }
+
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "ios",
+        target_os = "android"
+    )))]
     {
         let _ = (producer, overruns, fault);
         Err(Error::NoDevice("system audio (unsupported platform)"))

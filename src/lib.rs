@@ -142,7 +142,13 @@ impl Recording {
     /// [`Segment`] timestamps are read from the wall clock as each segment
     /// completes, a track added by the switch is timestamped correctly from the
     /// moment its audio arrives.
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedSource`] when `source` needs system audio on
+    /// a platform without loopback capture (iOS/Android), and
+    /// [`Error::NotRunning`] when the recording has already stopped.
     pub fn set_source(&self, source: Source) -> Result<()> {
+        source.ensure_supported()?;
         self.commands
             .send(WorkerCommand::SetSource(source))
             .map_err(|_| Error::NotRunning)

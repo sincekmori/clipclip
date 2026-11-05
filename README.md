@@ -149,6 +149,16 @@ To drop the native Opus dependency entirely:
 clipclip = { version = "0.1", default-features = false }   # WAV only, no CMake
 ```
 
+## Platform support
+
+| Platform | Mic | System audio (loopback) | Opus | Silero VAD | Notes |
+|---|---|---|---|---|---|
+| Windows | ✅ | ✅ WASAPI loopback | ✅ | ✅ | |
+| macOS | ✅ | ✅ process tap (14.2+) | ✅ | ✅ | Screen Recording permission for loopback |
+| Linux | ✅ | ✅ PulseAudio/PipeWire monitor | ✅ | ✅ | needs `libasound2-dev` to build |
+| iOS | ✅ | ❌ (OS restriction) | ✅ | ❌ untested | see [iOS](#ios) |
+| Android | ✅ | ❌ (OS restriction) | ✅ | ❌ untested | API 26+; see [Android](#android) |
+
 ## Platform notes
 
 - **Microphone**: default input device on all platforms.
@@ -158,7 +168,31 @@ clipclip = { version = "0.1", default-features = false }   # WAV only, no CMake
     The mic needs **Microphone** permission.
   - **Linux** — captured from the default output's PulseAudio/PipeWire **monitor** source (cpal's PulseAudio backend, enabled automatically).
     Needs a running PulseAudio / `pipewire-pulse` server.
+  - **iOS / Android** — not possible: neither OS allows an app to capture other apps' / system output.
+    `Source::System`, `Source::Mixed` and `Source::Separate` are rejected with `Error::UnsupportedSource` (from `start` and from `Recording::set_source`), so a UI can explain the limitation instead of hitting a missing-device error.
 - **Linux build**: install ALSA dev headers (`libasound2-dev`).
+
+### iOS
+
+Everything below applies to the app that embeds clipclip (e.g. a Tauri mobile app); clipclip itself only opens the default input and captures.
+
+- **Audio session is the host app's responsibility.** clipclip (and cpal underneath) never touches `AVAudioSession` category or activation.
+  Configure it in native app code (Swift plugin / AppDelegate) before calling `start()` — that keeps clipclip from fighting the host over session configuration and keeps background audio working:
+  - set the category to `.playAndRecord` (or `.record`), typically with `.allowBluetooth` if headsets should work, and
+  - call `setActive(true)`.
+- **Permissions / Info.plist**: `NSMicrophoneUsageDescription` is required. For recording to continue in the background, add `UIBackgroundModes: audio`.
+- **Interruptions** (incoming call, Siri, another app taking the session): iOS silently stops delivering input; no stream error is raised. clipclip detects the resulting stall after ~10 s of zero captured audio and stops the recording: `is_running()` turns `false` and `stop()` returns `Error::DeviceLost` — the same contract as a device fault on desktop. Restart recording (after re-activating the session) when your app decides to resume; observing `AVAudioSessionInterruptionNotification` in the host app gives a faster, richer signal than the stall detector if you want to react immediately.
+- **Route changes**: cpal reports audio-route changes (headset unplugged, category changed, output overridden) as stream errors, so they stop the recording the same way — including a route change your own app triggers by reconfiguring the session mid-recording.
+  Configure the session before `start()`, and restart the recording after an intentional route change.
+
+### Android
+
+- **Requirements**: API level 26+ (AAudio backend), `RECORD_AUDIO` runtime permission granted **before** `start()` is called.
+- **Background recording**: run a foreground service with `foregroundServiceType="microphone"`; without it the OS mutes or kills mic input when the app leaves the foreground.
+- **JNI context**: cpal's device enumeration uses the JNI context from [`ndk-context`](https://docs.rs/ndk-context). App frameworks (Tauri v2 mobile, `android-activity`, …) initialize it automatically; a bare `cdylib` embedded some other way must initialize `ndk-context` itself before calling `start()`.
+- **Interruptions**: a device switch or the mic being taken by a phone call either raises an AAudio stream error (recording stops, `is_running()` → `false`, `stop()` → `Error::DeviceLost`) or falls into the same ~10 s stall detector as iOS.
+- **Build**: cross-compile with [`cargo-ndk`](https://github.com/bbqsrc/cargo-ndk), e.g. `cargo ndk -t arm64-v8a -P 26 build --release`.
+  Set `ANDROID_NDK_HOME` (read by cargo-ndk) **and** `ANDROID_NDK_ROOT` (read by CMake, which builds the vendored libopus of the `opus` feature) to your NDK path; the `cc`-built parts pick up the toolchain from cargo-ndk automatically.
 
 ### Opus on Linux
 
