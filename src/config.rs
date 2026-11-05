@@ -11,6 +11,12 @@ use crate::error::{Error, Result};
 /// stream of segments, while [`Separate`](Source::Separate) produces two — one
 /// per source. Each delivered [`Segment`](crate::Segment) is tagged with its
 /// [`Track`](crate::Track).
+///
+/// **Mobile:** iOS and Android do not allow loopback capture of system audio,
+/// so only [`Mic`](Source::Mic) is available there. The other variants are
+/// rejected with [`Error::UnsupportedSource`](crate::Error::UnsupportedSource)
+/// by [`start`](crate::start) (via config validation) and
+/// [`Recording::set_source`](crate::Recording::set_source).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
     /// Microphone only (default input device). One stream ([`Track::Mic`]).
@@ -41,6 +47,22 @@ impl Source {
     }
     pub(crate) fn needs_system(self) -> bool {
         matches!(self, Source::System | Source::Mixed | Source::Separate)
+    }
+    /// Reject sources the current platform cannot capture. iOS and Android do
+    /// not allow loopback capture of system audio, so every variant needing it
+    /// fails there with [`Error::UnsupportedSource`] — checked up front (in
+    /// [`Config::validate`] and [`Recording::set_source`]) so the caller gets a
+    /// clear error instead of a missing-device failure at stream-open time.
+    ///
+    /// [`Recording::set_source`]: crate::Recording::set_source
+    pub(crate) fn ensure_supported(self) -> Result<()> {
+        #[cfg(any(target_os = "ios", target_os = "android"))]
+        if self.needs_system() {
+            return Err(Error::UnsupportedSource(
+                "system audio (loopback) cannot be captured on iOS/Android; use Source::Mic",
+            ));
+        }
+        Ok(())
     }
     /// True when the two sources are delivered as separate streams rather than
     /// summed into one.
@@ -175,6 +197,7 @@ impl Config {
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
+        self.source.ensure_supported()?;
         if self.sample_rate == 0 {
             return Err(Error::Config("sample_rate must be > 0".into()));
         }
@@ -203,6 +226,26 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(cfg.min_final_samples(), 48_000);
+    }
+
+    #[test]
+    fn desktop_supports_every_source() {
+        // On desktop `ensure_supported` is a no-op; the mobile rejection path
+        // is exercised by the mobile builds (cfg ios/android) instead.
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        for s in [Source::Mic, Source::System, Source::Mixed, Source::Separate] {
+            assert!(s.ensure_supported().is_ok());
+        }
+        #[cfg(any(target_os = "ios", target_os = "android"))]
+        {
+            assert!(Source::Mic.ensure_supported().is_ok());
+            for s in [Source::System, Source::Mixed, Source::Separate] {
+                assert!(matches!(
+                    s.ensure_supported(),
+                    Err(Error::UnsupportedSource(_))
+                ));
+            }
+        }
     }
 
     #[test]

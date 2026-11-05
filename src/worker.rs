@@ -33,6 +33,15 @@ const POP_SCRATCH: usize = 4096;
 const TICK: Duration = Duration::from_millis(20);
 /// Upper bound for user gain (~ +18 dB).
 const MAX_GAIN: f32 = 8.0;
+/// Mobile only: treat capture as stalled when every active source has delivered
+/// zero samples for this long. iOS does not report an audio-session
+/// interruption (e.g. an incoming phone call) through cpal's stream-error
+/// callback — the input unit just silently stops rendering — so without this
+/// the worker would sit forever looking alive while capturing nothing. Desktop
+/// backends keep invoking the data callback with silence, so this never fires
+/// there (and the check is compiled out to keep desktop behavior identical).
+#[cfg(any(target_os = "ios", target_os = "android"))]
+const STALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Clears the `running` flag when the worker exits — including on an unwinding
 /// panic out of the user's handler — so [`Recording::is_running`] can't get
@@ -517,6 +526,9 @@ pub(crate) fn run<H>(
 
     let mut last_overruns: u64 = 0;
 
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    let mut last_data = std::time::Instant::now();
+
     loop {
         let should_stop = stop.load(Ordering::Relaxed);
         let device_failed = fault.lock().map_or(true, |g| g.is_some());
@@ -555,6 +567,26 @@ pub(crate) fn run<H>(
         }
         scale_in_place(&mut mic16k, mic_gain);
         scale_in_place(&mut sys16k, system_gain);
+
+        // Stall watchdog (see STALL_TIMEOUT): report a silent capture stall as
+        // a device fault so `is_running()` drops to false and `stop()` returns
+        // `DeviceLost` — the same path as an ordinary stream error.
+        #[cfg(any(target_os = "ios", target_os = "android"))]
+        if !mic16k.is_empty() || !sys16k.is_empty() {
+            last_data = std::time::Instant::now();
+        } else if (mic_state.is_some() || sys_state.is_some())
+            && last_data.elapsed() >= STALL_TIMEOUT
+        {
+            if let Ok(mut slot) = fault.lock() {
+                slot.get_or_insert_with(|| {
+                    format!(
+                        "capture stalled: no audio for {}s (audio session \
+                         interrupted or microphone taken by another app?)",
+                        STALL_TIMEOUT.as_secs()
+                    )
+                });
+            }
+        }
 
         if mode.is_separate() {
             // The delivery path keeps the tracks apart, so only here does the

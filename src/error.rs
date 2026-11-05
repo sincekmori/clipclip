@@ -8,6 +8,14 @@ pub enum Error {
     /// PulseAudio monitor source on Linux).
     #[error("no {0} device available")]
     NoDevice(&'static str),
+    /// The requested [`Source`](crate::Source) cannot be captured on this
+    /// platform. On iOS and Android the OS does not allow loopback capture of
+    /// system audio, so [`Source::System`](crate::Source::System),
+    /// [`Source::Mixed`](crate::Source::Mixed) and
+    /// [`Source::Separate`](crate::Source::Separate) are rejected there — use
+    /// [`Source::Mic`](crate::Source::Mic).
+    #[error("unsupported source on this platform: {0}")]
+    UnsupportedSource(&'static str),
     /// A device query/configuration failed.
     #[error("audio device error: {0}")]
     Device(String),

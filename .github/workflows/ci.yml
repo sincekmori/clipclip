@@ -60,6 +60,61 @@ jobs:
       - name: build (no default features — WAV only, no native codec deps)
         run: cargo build --no-default-features
 
+  mobile:
+    name: mobile clippy (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-ios
+            os: macos-latest
+          - target: aarch64-apple-ios-sim
+            os: macos-latest
+          - target: aarch64-linux-android
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          env-vars: "ImageOS ImageVersion"
+          key: ${{ matrix.target }}
+      # cargo-ndk wires the preinstalled NDK toolchain into rustc and into the
+      # cc/cmake builds of the vendored libopus/libopusenc. `cache-bin` in
+      # rust-cache keeps ~/.cargo/bin, so the install is a no-op after the
+      # first run.
+      - name: install cargo-ndk
+        if: contains(matrix.target, 'android')
+        run: cargo install cargo-ndk
+      # ANDROID_NDK_HOME is read by cargo-ndk; ANDROID_NDK_ROOT by CMake's
+      # Android platform detection (the vendored libopus builds with cmake).
+      # Point both at the same (latest preinstalled) NDK. The runner exports
+      # ANDROID_NDK_LATEST_HOME only as a process env var — it is not in the
+      # `${{ env }}` context — so it has to be read from the shell.
+      - name: point ANDROID_NDK_HOME / ANDROID_NDK_ROOT at the preinstalled NDK
+        if: contains(matrix.target, 'android')
+        run: |
+          test -d "$ANDROID_NDK_LATEST_HOME"
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+      # `-P 26`: cpal's AAudio backend needs Android API level 26+.
+      - name: clippy (android, default features incl. opus)
+        if: contains(matrix.target, 'android')
+        run: cargo ndk -t arm64-v8a -P 26 clippy --all-targets -- -D warnings
+      - name: build (android, no default features)
+        if: contains(matrix.target, 'android')
+        run: cargo ndk -t arm64-v8a -P 26 build --no-default-features
+      - name: clippy (ios, default features incl. opus)
+        if: contains(matrix.target, 'apple-ios')
+        run: cargo clippy --target ${{ matrix.target }} --all-targets -- -D warnings
+      - name: build (ios, no default features)
+        if: contains(matrix.target, 'apple-ios')
+        run: cargo build --target ${{ matrix.target }} --no-default-features
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest
