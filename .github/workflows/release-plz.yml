@@ -22,6 +22,11 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
+      # ALSA headers are needed by alsa-sys (via cpal) on Linux. release-plz
+      # builds the crate here: `release` runs `cargo publish` and `release-pr`
+      # runs cargo-semver-checks (rustdoc), and both fail without `alsa.pc`.
+      - name: install Linux audio deps
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - uses: release-plz/action@v0.5
         with:
           command: release
@@ -45,6 +50,11 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
+      # ALSA headers are needed by alsa-sys (via cpal) on Linux. release-plz
+      # builds the crate here: `release` runs `cargo publish` and `release-pr`
+      # runs cargo-semver-checks (rustdoc), and both fail without `alsa.pc`.
+      - name: install Linux audio deps
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - uses: release-plz/action@v0.5
         with:
           command: release-pr
